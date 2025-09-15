@@ -1,0 +1,384 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Store Coverage – Red/Blue</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100vh; width: 100vw; }
+    .panel {
+      background: #fff;
+      padding: 8px 10px;
+      border-radius: 10px;
+      box-shadow: 0 2px 10px rgba(0,0,0,.1);
+      font: 14px/1.2 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .leaflet-control { z-index: 10000 !important; }
+    .legend .swatch { display:inline-block; width:12px; height:12px; margin-right:6px; border-radius: 50%; vertical-align: -1px; }
+    .toolbar input { width: 72px; }
+    .toolbar label { margin-left: 8px; user-select: none; }
+    .counts { opacity: .8; margin-left: 10px; }
+    .unit { opacity: .7; margin-left: 6px; font-style: italic; white-space: nowrap; }
+    .sep { margin: 0 6px; opacity: .5; }
+    .error-banner {
+      position: absolute; top: 12px; right: 12px; z-index: 10001;
+      background: #fee2e2; color: #991b1b; border: 1px solid #fecaca;
+      padding: 8px 10px; border-radius: 10px; max-width: 520px;
+      font: 14px/1.3 system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+      display: none;
+    }
+    .error-banner b { display:block; margin-bottom:4px; }
+    .error-banner code { background: #fff; padding: 1px 4px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="error" class="error-banner"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+  <script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+
+  <script>
+    // ---------- Map setup ----------
+    const START = [39.5, -98.35];
+    const START_ZOOM = 4;
+    const map = L.map('map').setView(START, START_ZOOM);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors'
+    }).addTo(map);
+
+    const redLayer  = L.layerGroup().addTo(map);
+    const blueLayer = L.layerGroup().addTo(map);
+    const circleLayer = L.layerGroup().addTo(map);
+
+    const redIcon  = (c='#e11d48') => L.circleMarker([0,0], { radius: 6, color:c, fillColor:c, fillOpacity:0.9, weight:1 });
+    const blueIcon = (c='#2563eb') => L.circleMarker([0,0], { radius: 5, color:c, fillColor:c, fillOpacity:0.9, weight:1 });
+
+    // ---------- Controls ----------
+    const ToolbarControl = L.Control.extend({
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-control');
+        container.innerHTML = `
+          <div class="panel toolbar">
+            Radius (km): <input id="radiusKm" type="number" step="1" min="1" value="20">
+            <span class="unit" id="milesLabel">(≈ 12.4 mi)</span>
+            <span class="sep">|</span>
+            Avg speed (km/h): <input id="speedKmh" type="number" step="1" min="1" value="35">
+            <span class="unit" id="mphLabel">(≈ 21.7 mph)</span>
+            <span class="unit" id="etaLabel">≈ 34.3 min</span>
+            <button id="applyRadius" style="margin-left:8px;">Apply</button>
+            <label title="When checked, recompute red/blue using a greedy algorithm for the current radius. If off, use the CSV's existing 'status' column.">
+              <input id="recomputeToggle" type="checkbox" checked>
+              Recompute greedy
+            </label>
+            <span id="counts" class="counts"></span>
+          </div>
+        `;
+        L.DomEvent.disableClickPropagation(container);
+        L.DomEvent.disableScrollPropagation(container);
+        return container;
+      },
+      onRemove: function() {}
+    });
+    map.addControl(new ToolbarControl({ position: 'topleft' }));
+
+    const LegendControl = L.Control.extend({
+      onAdd: function() {
+        const container = L.DomUtil.create('div', 'leaflet-control');
+        container.innerHTML = `
+          <div class="panel legend">
+            <div><span class="swatch" style="background:#e11d48;"></span> Red (coverage centers)</div>
+            <div><span class="swatch" style="background:#2563eb;"></span> Blue (covered stores)</div>
+          </div>
+        `;
+        L.DomEvent.disableClickPropagation(container);
+        return container;
+      },
+      onRemove: function() {}
+    });
+    map.addControl(new LegendControl({ position: 'bottomleft' }));
+
+    // ---------- Data & helpers ----------
+    let allRows = [];          // normalized CSV rows
+    let statuses = [];         // current statuses array (parallel to allRows)
+    let currentRadiusKm = 20;  // live radius
+    let speedKmh = 35;         // live average speed estimate
+    let boundsFitted = false;  // fit bounds only once to avoid flicker
+
+    function showError(msg) {
+      const el = document.getElementById('error');
+      if (!el) return;
+      el.innerHTML = '<b>Heads up</b>' + msg;
+      el.style.display = 'block';
+    }
+
+    function readNumber(x) {
+      const v = Number(x);
+      return Number.isFinite(v) ? v : null;
+    }
+
+    // Haversine (km)
+    function haversineKm(lat1, lon1, lat2, lon2) {
+      const R = 6371.0088;
+      const toRad = (d) => d * Math.PI / 180;
+      const phi1 = toRad(lat1), phi2 = toRad(lat2);
+      const dphi = toRad(lat2 - lat1);
+      const dlambda = toRad(lon2 - lon1);
+      const a = Math.sin(dphi/2)**2 + Math.cos(phi1) * Math.cos(phi2) * Math.sin(dlambda/2)**2;
+      return 2 * R * Math.asin(Math.sqrt(a));
+    }
+
+    // Greedy set cover selection
+    function greedyCover(radiusKm) {
+      const n = allRows.length;
+      const uncovered = new Set(Array.from({length:n}, (_,i)=>i));
+      const redIdxs = [];
+      const neighbors = Array.from({length:n}, () => []);
+
+      for (let i=0; i<n; i++) {
+        const si = allRows[i];
+        const lat1 = readNumber(si.lat), lon1 = readNumber(si.long);
+        if (lat1 === null || lon1 === null) continue;
+        for (let j=0; j<n; j++) {
+          const sj = allRows[j];
+          const lat2 = readNumber(sj.lat), lon2 = readNumber(sj.long);
+          if (lat2 === null || lon2 === null) continue;
+          const d = haversineKm(lat1, lon1, lat2, lon2);
+          if (d <= radiusKm) neighbors[i].push(j);
+        }
+      }
+
+      while (uncovered.size > 0) {
+        let bestI = -1, bestGain = -1, bestCover = null;
+        for (let i=0; i<n; i++) {
+          const candidates = neighbors[i].filter(j => uncovered.has(j));
+          const gain = candidates.length;
+          if (gain > bestGain) {
+            bestGain = gain;
+            bestI = i;
+            bestCover = candidates;
+          }
+        }
+        if (bestI === -1) break;
+        redIdxs.push(bestI);
+        bestCover.forEach(j => uncovered.delete(j));
+      }
+
+      const st = Array(n).fill('blue');
+      redIdxs.forEach(i => st[i] = 'red');
+      return st;
+    }
+
+    function kmToMiles(km) { return km * 0.621371; }
+    function kmhToMph(kmh) { return kmh * 0.621371; }
+
+    function updateDerivedLabels() {
+      const mi = kmToMiles(currentRadiusKm);
+      const milesEl = document.getElementById('milesLabel');
+      if (milesEl) milesEl.textContent = `(≈ ${mi.toFixed(1)} mi)`;
+
+      const mph = kmhToMph(speedKmh);
+      const mphEl = document.getElementById('mphLabel');
+      if (mphEl) mphEl.textContent = `(≈ ${mph.toFixed(1)} mph)`;
+
+      const etaMin = speedKmh > 0 ? (currentRadiusKm / speedKmh) * 60 : NaN;
+      const etaEl = document.getElementById('etaLabel');
+      if (etaEl) etaEl.textContent = Number.isFinite(etaMin) ? `≈ ${etaMin.toFixed(1)} min` : '—';
+    }
+
+    function draw() {
+      redLayer.clearLayers();
+      blueLayer.clearLayers();
+      circleLayer.clearLayers();
+
+      const latlngs = [];
+      let reds = 0, blues = 0;
+
+      for (let i=0; i<allRows.length; i++) {
+        const d = allRows[i];
+        const lat = readNumber(d.lat);
+        const lon = readNumber(d.long);
+        if (lat === null || lon === null) continue;
+        latlngs.push([lat, lon]);
+
+        const title = d.store_name || d.store_id || '';
+        const addr = [d.address, d.city, d.state, d.zip_code].filter(Boolean).join(', ');
+        const phone = d.phone_number || '';
+        const status = statuses[i] || 'blue';
+
+        if (status.toLowerCase() === 'red') {
+          reds++;
+          redIcon().setLatLng([lat, lon]).bindPopup(
+            `<b>${title}</b><br>${addr}<br>${phone}<br><i>Red</i>`
+          ).addTo(redLayer);
+          L.circle([lat, lon], {
+            radius: currentRadiusKm * 1000,
+            color: '#f43f5e',
+            fillColor: '#fda4af',
+            fillOpacity: 0.12,
+            weight: 1
+          }).addTo(circleLayer);
+        } else {
+          blues++;
+          blueIcon().setLatLng([lat, lon]).bindPopup(
+            `<b>${title}</b><br>${addr}<br>${phone}<br><i>Blue</i>`
+          ).addTo(blueLayer);
+        }
+      }
+
+      if (!latlngs.length) {
+        showError('0 points drawn. Check <code>red_blue.csv</code> has numeric <code>lat</code> and <code>long</code> values.');
+      } else {
+        const countsEl = document.getElementById('counts');
+        if (!boundsFitted) {
+          map.fitBounds(latlngs, { padding: [20,20] });
+          boundsFitted = true;
+        }
+        if (countsEl) countsEl.textContent = `Reds: ${reds} | Blues: ${blues} | Radius: ${currentRadiusKm} km (≈ ${kmToMiles(currentRadiusKm).toFixed(1)} mi), ETA ≈ ${ (speedKmh>0 ? ((currentRadiusKm/speedKmh)*60).toFixed(1) : '—') } min`;
+      }
+    }
+
+    function wireToolbar() {
+      const applyBtn = document.getElementById('applyRadius');
+      const radiusInput = document.getElementById('radiusKm');
+      const speedInput = document.getElementById('speedKmh');
+      const recompute = document.getElementById('recomputeToggle');
+
+      if (radiusInput) {
+        radiusInput.addEventListener('input', () => {
+          const v = Number(radiusInput.value);
+          if (Number.isFinite(v) && v > 0) {
+            currentRadiusKm = v;
+            updateDerivedLabels();
+          }
+        });
+      }
+      if (speedInput) {
+        speedInput.addEventListener('input', () => {
+          const v = Number(speedInput.value);
+          if (Number.isFinite(v) && v > 0) {
+            speedKmh = v;
+            updateDerivedLabels();
+          }
+        });
+      }
+
+      if (applyBtn && radiusInput) {
+        applyBtn.addEventListener('click', () => {
+          const r = Number(radiusInput.value);
+          const s = Number(speedInput.value);
+          if (Number.isFinite(r) && r > 0) currentRadiusKm = r;
+          if (Number.isFinite(s) && s > 0) speedKmh = s;
+          updateDerivedLabels();
+          if (recompute && recompute.checked) {
+            statuses = greedyCover(currentRadiusKm);
+          } else {
+            statuses = allRows.map(r => (r.status ? String(r.status) : 'blue'));
+          }
+          draw();
+        });
+      }
+
+      if (recompute) {
+        recompute.addEventListener('change', () => {
+          if (recompute.checked) {
+            statuses = greedyCover(currentRadiusKm);
+          } else {
+            statuses = allRows.map(r => (r.status ? String(r.status) : 'blue'));
+          }
+          draw();
+        });
+      }
+    }
+
+    // Normalize headers: trim + lowercase
+    function normalizeRowKeys(row) {
+      const out = {};
+      for (const k in row) {
+        if (!Object.prototype.hasOwnProperty.call(row, k)) continue;
+        const nk = String(k).trim().toLowerCase();
+        out[nk] = row[k];
+      }
+      return out;
+    }
+
+    // Canonicalize a row to required fields
+    function canonicalize(row) {
+      const r = normalizeRowKeys(row);
+      const lat = r['lat'] ?? r['latitude'] ?? r['y'];
+      const lon = r['long'] ?? r['lon'] ?? r['lng'] ?? r['longitude'] ?? r['x'];
+      return {
+        store_id: r['store_id'] ?? r['id'] ?? '',
+        store_name: r['store_name'] ?? r['name'] ?? '',
+        address: r['address'] ?? '',
+        city: r['city'] ?? '',
+        state: r['state'] ?? '',
+        zip_code: r['zip_code'] ?? r['zip'] ?? '',
+        phone_number: r['phone_number'] ?? r['phone'] ?? '',
+        lat: lat,
+        long: lon,
+        status: r['status'] ?? '',
+        radius_km: r['radius_km'] ?? ''
+      };
+    }
+
+    async function headThenLoadCsv() {
+      try {
+        const baseUrl = new URL(window.location.href);
+        const csvUrl = new URL('red_blue.csv', baseUrl).toString();
+        const bust = (csvUrl.includes('?') ? '&' : '?') + 'v=' + Date.now();
+        const finalUrl = csvUrl + bust;
+
+        console.log('Fetching CSV from:', finalUrl);
+        const headResp = await fetch(finalUrl, { method: 'HEAD' });
+        if (!headResp.ok) {
+          showError(`Could not load <code>red_blue.csv</code> (HTTP ${headResp.status}). I tried: <code>${finalUrl}</code>. Check the filename (case-sensitive) and that it lives next to this page.`);
+          return;
+        }
+
+        Papa.parse(finalUrl, {
+          download: true,
+          header: true,
+          dynamicTyping: true,
+          complete: (results) => {
+            try {
+              const raw = results.data || [];
+              allRows = raw.map(canonicalize).filter(r => r.lat !== undefined && r.long !== undefined);
+
+              const rowWithRadius = allRows.find(r => r.radius_km !== undefined && r.radius_km !== null && r.radius_km !== '');
+              if (rowWithRadius && Number(rowWithRadius.radius_km)) currentRadiusKm = Number(rowWithRadius.radius_km);
+
+              statuses = greedyCover(currentRadiusKm);
+
+              setTimeout(() => {
+                const rIn = document.getElementById('radiusKm');
+                const sIn = document.getElementById('speedKmh');
+                if (rIn) rIn.value = currentRadiusKm;
+                if (sIn) sIn.value = 35;
+                updateDerivedLabels();
+              }, 0);
+
+              wireToolbar();
+              draw();
+            } catch (e) {
+              console.error(e);
+              showError('Parsed CSV but ran into an error drawing points. Check that the CSV has numeric <code>lat</code>/<code>long</code> values.');
+            }
+          },
+          error: (err) => {
+            console.error(err);
+            showError(`Could not parse <code>red_blue.csv</code>. I tried: <code>${finalUrl}</code>. Ensure the file is valid CSV with a header row.`);
+          }
+        });
+      } catch (e) {
+        console.error(e);
+        showError('Unexpected error building the CSV URL. This can happen if the page URL is malformed.');
+      }
+    }
+
+    headThenLoadCsv();
+  </script>
+</body>
+</html>
